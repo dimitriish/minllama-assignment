@@ -216,7 +216,7 @@ def generate_sentence(args, prefix, outfile, max_new_tokens = 75, temperature = 
 				print(f"Temperature is {temperature}")
 				print(sentence)
 				print('---------------')
-				writer = open(outfile, 'w')
+				writer = open(outfile, 'w', encoding='utf-8')
 				writer.write(sentence)
 				print(f"Wrote generated sentence to {outfile}.")
 				writer.close()

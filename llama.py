@@ -9,6 +9,7 @@ from base_llama import LlamaPreTrainedModel, LlamaConfig
 from rope import apply_rotary_emb
 from utils import *
 
+
 # Root Mean Square Layer Normalization (https://arxiv.org/abs/1910.07467)
 # borrowed from the official Llama implementation:
 # https://github.com/facebookresearch/llama/blob/main/llama/model.py
@@ -44,7 +45,7 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The normalized tensor.
         """
         # todo
-        raise NotImplementedError
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         """
@@ -59,6 +60,7 @@ class RMSNorm(torch.nn.Module):
         """
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
+
 
 class Attention(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -94,11 +96,20 @@ class Attention(nn.Module):
         attention matrix before applying it to the value tensor.
         '''
         # todo
-        raise NotImplementedError
+        bs, n_local_heads, seqlen, head_dim = query.shape
+        att = (query @ key.transpose(-2, -1)) * (1.0 / math.sqrt(key.size(-1)))
+        mask = torch.tril(torch.ones((seqlen, seqlen), device=query.device)).unsqueeze(0).unsqueeze(0)
+        att = att.masked_fill(mask == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ value
+        y = y.transpose(1, 2).contiguous().view(bs, seqlen, n_local_heads * head_dim)
+
+        return y
 
     def forward(
-        self,
-        x: torch.Tensor
+            self,
+            x: torch.Tensor
     ):
         '''
         Llama2 uses Grouped-Query Attention. The details of GQA are actually
@@ -197,7 +208,13 @@ class LlamaLayer(nn.Module):
            output of the feed-forward network
         '''
         # todo
-        raise NotImplementedError
+        x1 = self.attention_norm(x)
+        x2 = self.attention(x1)
+        x3 = x + x2
+        x4 = self.ffn_norm(x3)
+        x5 = self.feed_forward(x4)
+        return x5 + x3
+
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -219,7 +236,7 @@ class Llama(LlamaPreTrainedModel):
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
+        self.tok_embeddings.weight = self.output.weight  # https://paperswithcode.com/method/weight-tying
 
         # some useful precompute for the RoPE relative positional embeddings
 
@@ -228,7 +245,7 @@ class Llama(LlamaPreTrainedModel):
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('w3.weight') or pn.endswith('compute_output.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layers))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -252,7 +269,7 @@ class Llama(LlamaPreTrainedModel):
             logits = self.output(h)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.output(h[:, [-1], :])  # note: using list [-1] to preserve the time dim
 
         return logits, h
 
@@ -272,13 +289,11 @@ class Llama(LlamaPreTrainedModel):
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] # crop to just the final time step
+            logits = logits[:, -1, :]  # crop to just the final time step
             # todo
-            raise NotImplementedError
-
             if temperature == 0.0:
                 # select the single most likely index
-                idx_next = None
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 '''
                 Perform temperature sampling:
@@ -289,32 +304,34 @@ class Llama(LlamaPreTrainedModel):
 
                 Note that we are not using top-k sampling/nucleus sampling in this procedure.
                 '''
-                idx_next = None
+                logits /= temperature
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
-
         return idx
 
+
 def load_pretrained(checkpoint):
-  device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-  #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-  dtype = "float32"
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
+    # dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+    dtype = "float32"
 
-  torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-  torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-  device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-  ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-  ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
+    torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+    device_type = 'cuda' if 'cuda' in device else 'cpu'  # for later use in torch.autocast
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-  # init from a model saved in a specific directory
-  checkpoint_dict = torch.load(checkpoint, map_location=device)
-  config = LlamaConfig(**checkpoint_dict['model_args'])
-  model = Llama(config)
-  state_dict = checkpoint_dict['model']
-  unwanted_prefix = '_orig_mod.'
-  for k,v in list(state_dict.items()):
-      if k.startswith(unwanted_prefix):
-          state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-  model.load_state_dict(state_dict, strict=False)
-  return model
+    # init from a model saved in a specific directory
+    checkpoint_dict = torch.load(checkpoint, map_location=device)
+    config = LlamaConfig(**checkpoint_dict['model_args'])
+    model = Llama(config)
+    state_dict = checkpoint_dict['model']
+    unwanted_prefix = '_orig_mod.'
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict, strict=False)
+    return model
